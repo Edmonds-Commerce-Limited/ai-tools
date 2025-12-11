@@ -1,8 +1,12 @@
 # Reusable workflow for Claude PR Review
 # This workflow contains the core PR review logic to be called from repositories
-# Version: 2.4.1 - Fix cache path to include entire Claude installation
+# Version: 2.4.2 - Fix MCP configuration to use NPM package instead of invalid HTTP endpoint
 #
 # Changes:
+#   v2.4.2: Fix MCP server configuration
+#           - Replace invalid GitHub Copilot MCP endpoint with NPM package
+#           - Use @modelcontextprotocol/server-github via npx (same as triage workflow)
+#           - Fixes permission denials for mcp__github__* tools
 #   v2.4.1: Fix cache path to include entire ~/.local directory
 #           - Cache was only saving 225 bytes (empty cache)
 #           - Now caches ~/.local/bin and ~/.local/share/claude
@@ -282,15 +286,15 @@ jobs:
           printf '%s\n' '{
             "mcpServers": {
               "github": {
-                "type": "http",
-                "url": "https://api.githubcopilot.com/mcp/",
-                "headers": {
-                  "Authorization": "Bearer '"${GITHUB_TOKEN}"'"
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-github"],
+                "env": {
+                  "GITHUB_PERSONAL_ACCESS_TOKEN": "'"${GITHUB_TOKEN}"'"
                 }
               }
             }
           }' > ${{ runner.temp }}/mcp-config/github.json
-          echo "MCP configuration created (using GitHub's hosted MCP server)"
+          echo "MCP configuration created"
 
       - name: 'Write Claude Prompt'
         run: |
