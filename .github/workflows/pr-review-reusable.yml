@@ -1,8 +1,13 @@
 # Reusable workflow for Claude PR Review
 # This workflow contains the core PR review logic to be called from repositories
-# Version: 2.4.2 - Fix MCP configuration to use NPM package instead of invalid HTTP endpoint
+# Version: 2.4.3 - Fix allowedTools wildcard pattern to explicitly list GitHub MCP tools
 #
 # Changes:
+#   v2.4.3: Fix allowedTools permission denials
+#           - Replace wildcard pattern mcp__github__* with explicit tool list
+#           - Wildcards don't work with --allowedTools flag
+#           - Explicitly grant: get_pull_request, get_file_contents, list_commits, create_issue_comment, get_issue, search_code, create_pull_request_review
+#           - Matches working triage workflow pattern
 #   v2.4.2: Fix MCP server configuration
 #           - Replace invalid GitHub Copilot MCP endpoint with NPM package
 #           - Use @modelcontextprotocol/server-github via npx (same as triage workflow)
@@ -575,7 +580,7 @@ jobs:
 
           claude -p "$(cat ${{ runner.temp }}/claude-prompts/main.txt)" \
             --mcp-config "${{ runner.temp }}/mcp-config/github.json" \
-            --allowedTools "mcp__github__*,Read,WebFetch,Glob,Grep" \
+            --allowedTools "Read,WebFetch,Glob,Grep,mcp__github__get_pull_request,mcp__github__get_file_contents,mcp__github__list_commits,mcp__github__create_issue_comment,mcp__github__get_issue,mcp__github__search_code,mcp__github__create_or_update_file,mcp__github__push_files,mcp__github__create_pull_request_review" \
             --system-prompt "$(cat ${{ runner.temp }}/claude-prompts/system.txt)" \
             --output-format stream-json \
             --verbose 2>&1 | tee /tmp/pr-review-output.json
