@@ -1,0 +1,754 @@
+name: Claude Triage Reusable Workflow
+# Version: 5.6.8 - Add concurrency control to prevent duplicate triage
+# - Add concurrency group per issue to prevent race conditions
+# - Fixes issue where multiple events trigger simultaneous triages
+# - Uses cancel-in-progress: false to queue rather than cancel
+# This is the core reusable workflow that contains all triage logic
+# Called by minimal workflows in individual repositories
+
+on:
+  workflow_call:
+    inputs:
+      # Required contextual information
+      event_name:
+        description: 'GitHub event that triggered this workflow'
+        type: string
+        required: true
+      event_action:
+        description: 'GitHub event action (opened, edited, created)'
+        type: string
+        required: false
+
+      # Issue information
+      issue_number:
+        description: 'Issue number to analyze'
+        type: string
+        required: false
+      issue_title:
+        description: 'Issue title'
+        type: string
+        required: false
+      issue_body:
+        description: 'Issue body content'
+        type: string
+        required: false
+      issue_state:
+        description: 'Issue state (open/closed)'
+        type: string
+        required: false
+      issue_labels:
+        description: 'JSON array of existing issue labels'
+        type: string
+        required: false
+        default: '[]'
+
+      # Comment information (for issue_comment events)
+      comment_body:
+        description: 'Comment body that triggered the workflow'
+        type: string
+        required: false
+      comment_user:
+        description: 'User who made the comment'
+        type: string
+        required: false
+      comment_user_type:
+        description: 'Type of user (User/Bot)'
+        type: string
+        required: false
+
+      # Repository information
+      repository:
+        description: 'Repository in format owner/repo'
+        type: string
+        required: true
+      repository_owner:
+        description: 'Repository owner'
+        type: string
+        required: true
+      repository_name:
+        description: 'Repository name'
+        type: string
+        required: false
+
+      # Control flags
+      skip_relevance_check:
+        description: 'Skip repository relevance check'
+        type: boolean
+        required: false
+        default: false
+      recovery_mode:
+        description: 'Recovery mode for wrong-repo issues'
+        type: boolean
+        required: false
+        default: false
+
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        description: 'Claude Code OAuth token'
+        required: true
+
+jobs:
+  triage:
+    name: Intelligent Issue Triage
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    # Prevent duplicate triage runs on the same issue
+    # This fixes race conditions when multiple events trigger simultaneously
+    concurrency:
+      group: triage-${{ inputs.repository }}-${{ inputs.issue_number }}
+      cancel-in-progress: false
+
+    # Determine if we should run based on inputs
+    if: |
+      inputs.event_name == 'workflow_dispatch' ||
+      (inputs.event_name == 'issues' && inputs.event_action == 'opened') ||
+      (inputs.event_name == 'issues' && inputs.event_action == 'edited' && inputs.issue_state == 'open') ||
+      (inputs.event_name == 'issue_comment' &&
+       inputs.comment_user_type != 'Bot' &&
+       contains(inputs.issue_labels, 'wrong-repo') &&
+       contains(inputs.comment_body, '@claude relevant repo confirmed, execute triage'))
+
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      id-token: write
+
+    steps:
+      # ==================================================
+      # DEBUG AND SETUP PHASE
+      # ==================================================
+
+      - name: Debug Workflow Inputs
+        run: |
+          echo "🔍 Workflow triggered with:"
+          echo "Event: ${{ inputs.event_name }}"
+          echo "Action: ${{ inputs.event_action }}"
+          echo "Issue: #${{ inputs.issue_number }}"
+          echo "Repository: ${{ inputs.repository }}"
+          echo "Skip relevance: ${{ inputs.skip_relevance_check }}"
+          echo "Recovery mode: ${{ inputs.recovery_mode }}"
+
+      - name: Set Workflow Coordination Label
+        if: inputs.issue_number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "🏷️ Adding triage-in-progress label for workflow coordination..."
+
+          # Create label if it doesn't exist
+          gh label create triage-in-progress \
+            --repo ${{ inputs.repository }} \
+            --color 1d76db \
+            --description "Triage workflow is currently analyzing this issue" \
+            2>/dev/null || true
+
+          # Add the label to the issue
+          gh issue edit ${{ inputs.issue_number }} \
+            --repo ${{ inputs.repository }} \
+            --add-label triage-in-progress
+
+          echo "✅ Workflow coordination label added"
+
+      - name: Checkout Target Repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          fetch-depth: 1
+
+      - name: Get Shared Scripts Version
+        id: shared-version
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          COMMIT=$(gh api /repos/BallicomDev/ai-tools/contents/.github/shared-scripts-version.txt \
+            --jq '.content' | tr -d '"' | base64 -d | tr -d '[:space:]')
+          echo "commit=$COMMIT" >> $GITHUB_OUTPUT
+          echo "Using shared-scripts commit: $COMMIT"
+
+      - name: Checkout Shared Scripts
+        uses: actions/checkout@v4
+        with:
+          repository: BallicomDev/shared-scripts
+          ref: ${{ steps.shared-version.outputs.commit }}
+          path: .ai-tools-resources
+          sparse-checkout: |
+            scripts/workflow-resources
+            scripts/github-utils
+
+      # ==================================================
+      # FETCH ISSUE DETAILS (for workflow_dispatch)
+      # ==================================================
+
+      - name: Fetch Issue Details
+        id: fetch-issue
+        if: inputs.event_name == 'workflow_dispatch' && inputs.issue_number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          REPOSITORY: ${{ inputs.repository }}
+        run: bash .ai-tools-resources/scripts/workflow-resources/triage-reusable/fetch-issue-details.sh
+
+      # ==================================================
+      # FETCH COMPLETE ISSUE DATA
+      # ==================================================
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Fetch Complete Issue Data
+        id: fetch-complete
+        if: inputs.issue_number != ''
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          echo "📦 Fetching complete issue data with attachments..."
+
+          python .ai-tools-resources/scripts/github-utils/fetch-issue-complete.py \
+            --repo "${{ inputs.repository }}" \
+            --issue "${{ inputs.issue_number }}" \
+            --output-dir "${{ runner.temp }}/issue-data" \
+            --github-token "${{ github.token }}"
+
+          if [ -f "${{ runner.temp }}/issue-data/manifest.md" ]; then
+            echo "✅ Issue manifest generated successfully"
+            echo "manifest_path=${{ runner.temp }}/issue-data/manifest.md" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ Manifest file not found - may affect triage analysis"
+            echo "manifest_path=" >> $GITHUB_OUTPUT
+          fi
+
+      # ==================================================
+      # PROMPT PREPARATION
+      # ==================================================
+
+      - name: Prepare Claude Prompts
+        id: prepare-prompts
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+          RECOVERY_MODE: ${{ inputs.recovery_mode }}
+          COMMENT_BODY: ${{ inputs.comment_body }}
+          SKIP_RELEVANCE_CHECK: ${{ inputs.skip_relevance_check }}
+          REPOSITORY: ${{ inputs.repository }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          EVENT_NAME: ${{ inputs.event_name }}
+          FETCH_ISSUE_TITLE: ${{ steps.fetch-issue.outputs.title }}
+          FETCH_ISSUE_BODY: ${{ steps.fetch-issue.outputs.body }}
+          INPUT_ISSUE_TITLE: ${{ inputs.issue_title }}
+          INPUT_ISSUE_BODY: ${{ inputs.issue_body }}
+          WORKFLOW_VERSION: "5.5.0"
+        run: bash .ai-tools-resources/scripts/workflow-resources/triage-reusable/prepare-prompts.sh
+
+      # ==================================================
+      # REPOSITORY RELEVANCE CHECK
+      # ==================================================
+
+      # ============================================================================
+      # CLAUDE CLI SETUP - Inline execution due to cross-repository access limits
+      # Reusable workflows can't access host repo's composite actions, so we inline
+      # the Claude CLI installation and MCP configuration here.
+      # Setup runs unconditionally as it's needed for both relevance and triage.
+      # ============================================================================
+      - name: Setup Node.js for MCP
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Cache Claude CLI
+        id: cache-claude
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local/bin
+            ~/.local/share/claude
+          key: claude-cli-${{ runner.os }}-1.0.100
+          restore-keys: |
+            claude-cli-${{ runner.os }}-
+
+      - name: Install Claude CLI
+        id: install-claude
+        if: steps.cache-claude.outputs.cache-hit != 'true'
+        timeout-minutes: 5
+        run: bash .ai-tools-resources/scripts/workflow-resources/shared/install-claude-cli.sh
+
+      - name: Add Claude to PATH
+        run: echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Create MCP Configuration
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          # Create MCP config file to pass via --mcp-config flag
+          # settings.json doesn't work reliably in CI, so we use explicit flag
+          mkdir -p ${{ runner.temp }}/mcp-config
+          printf '%s\n' '{
+            "mcpServers": {
+              "github": {
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-github"],
+                "env": {
+                  "GITHUB_PERSONAL_ACCESS_TOKEN": "'"${GITHUB_TOKEN}"'"
+                }
+              }
+            }
+          }' > ${{ runner.temp }}/mcp-config/github.json
+          echo "MCP configuration created"
+          cat ${{ runner.temp }}/mcp-config/github.json
+
+      # ============================================================================
+      # REPOSITORY RELEVANCE CHECK
+      # ============================================================================
+
+      - name: Write Relevance System Prompt
+        if: inputs.skip_relevance_check != true && inputs.recovery_mode != true
+        run: |
+          cat > ${{ runner.temp }}/relevance-system-prompt.txt << 'EOF'
+          You are a repository relevance checker performing a FORMAL relevance assessment.
+
+          You have access to Glob and Grep tools to verify if mentioned components/files exist in this repository.
+          Use them when the issue mentions specific files, classes, or components to verify they exist here.
+
+          IMPORTANT: Only post a comment if the issue is NOT relevant to this repository.
+
+          - For RELEVANT issues: Do NOT post a comment. Simply output the ==REPO_CHECK== metadata with relevant=true.
+            The system will automatically add the "relevance-confirmed" label.
+
+          - For IRRELEVANT issues: Post a comment explaining why the issue belongs elsewhere and suggest alternatives.
+            Always include the ==REPO_CHECK== metadata in your comment with relevant=false.
+
+          This reduces noise while creating an audit trail for wrong-repo decisions.
+          EOF
+
+      - name: Check Repository Relevance
+        id: repo-check
+        if: inputs.skip_relevance_check != true && inputs.recovery_mode != true
+        timeout-minutes: 15
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          export PATH="$HOME/.claude/local/bin:$PATH"
+
+          claude -p "$(cat ${{ runner.temp }}/claude-prompts/relevance-check.txt)" \
+            --mcp-config "${{ runner.temp }}/mcp-config/github.json" \
+            --allowedTools "Read,WebFetch,Glob,Grep,mcp__github__add_issue_comment,mcp__github__get_issue,mcp__github__list_issue_comments,mcp__github__create_issue" \
+            --disallowedTools "Edit,Write,MultiEdit,NotebookEdit,Bash,Task,LS" \
+            --system-prompt "$(cat ${{ runner.temp }}/relevance-system-prompt.txt)" \
+            --output-format stream-json \
+            --verbose 2>&1 | tee /tmp/relevance-output.json
+
+          exit_code=${PIPESTATUS[0]}
+
+          # Capture output for downstream steps
+          if [[ -f /tmp/relevance-output.json ]]; then
+            echo "output<<OUTPUT_EOF" >> $GITHUB_OUTPUT
+            cat /tmp/relevance-output.json >> $GITHUB_OUTPUT
+            echo "OUTPUT_EOF" >> $GITHUB_OUTPUT
+          fi
+
+          exit $exit_code
+
+      - name: Parse Repository Check Result
+        id: parse-relevance
+        if: steps.repo-check.outcome == 'success' || steps.repo-check.outcome == 'skipped'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # If we skipped the check, log it clearly
+          if [ "${{ steps.repo-check.outcome }}" = "skipped" ]; then
+            if [ "${{ inputs.recovery_mode }}" = "true" ]; then
+              echo "⚠️ Relevance check skipped due to recovery mode"
+            else
+              echo "⚠️ Relevance check skipped (skip_relevance_check flag set)"
+            fi
+            echo "skip_triage=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Extract result text from JSONL output
+          # The output is multiple JSON lines; we need the final result
+          echo "🔍 Checking Claude output for relevance metadata..."
+
+          if [[ -f /tmp/relevance-output.json ]]; then
+            # Extract the result text from the JSONL stream
+            RESULT_TEXT=$(cat /tmp/relevance-output.json | jq -rs '[.[] | select(.type == "result")] | last | .result // ""')
+
+            if echo "$RESULT_TEXT" | grep -q "==REPO_CHECK=="; then
+              echo "✅ Found metadata in Claude result"
+              # Extract JSON between markers (handle escaped quotes by unescaping first)
+              METADATA=$(echo "$RESULT_TEXT" | sed -n 's/.*==REPO_CHECK==\(.*\)==REPO_CHECK==.*/\1/p' | head -1)
+            else
+              METADATA=""
+            fi
+          else
+            RESULT_TEXT=""
+            METADATA=""
+          fi
+
+          if [[ -z "$METADATA" ]]; then
+            # Fallback: Check if Claude posted a comment (for irrelevant issues)
+            echo "⏳ No metadata in result, checking for relevance comment..."
+            sleep 10
+
+            LATEST_COMMENT=$(gh api repos/${{ inputs.repository }}/issues/${{ inputs.issue_number }}/comments \
+              --jq '.[-1].body' 2>/dev/null || echo "")
+
+            if echo "$LATEST_COMMENT" | grep -q "==REPO_CHECK=="; then
+              echo "✅ Found metadata in comment"
+              METADATA=$(echo "$LATEST_COMMENT" | sed -n 's/.*==REPO_CHECK==\(.*\)==REPO_CHECK==.*/\1/p' | head -1)
+            fi
+          fi
+
+          # If still no metadata, assume relevant
+          if [[ -z "$METADATA" ]]; then
+            echo "⚠️ No relevance metadata found, assuming relevant"
+
+            # Add relevance-confirmed label since we're assuming relevant
+            gh label create relevance-confirmed \
+              --repo ${{ inputs.repository }} \
+              --color 0e8a16 \
+              --description "Issue relevance to this repository has been verified" \
+              2>/dev/null || true
+
+            gh issue edit ${{ inputs.issue_number }} \
+              --repo ${{ inputs.repository }} \
+              --add-label relevance-confirmed
+
+            echo "skip_triage=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Parse metadata
+          RELEVANT=$(echo "$METADATA" | jq -r '.relevant')
+          CONFIDENCE=$(echo "$METADATA" | jq -r '.confidence')
+          REASON=$(echo "$METADATA" | jq -r '.reason // "No reason provided"')
+
+          echo "📊 Relevance Check Result:"
+          echo "  - Relevant: $RELEVANT"
+          echo "  - Confidence: $CONFIDENCE"
+          echo "  - Reason: $REASON"
+
+          if [ "$RELEVANT" = "true" ]; then
+            echo "✅ Repository relevance confirmed"
+
+            # Create and add relevance-confirmed label
+            gh label create relevance-confirmed \
+              --repo ${{ inputs.repository }} \
+              --color 0e8a16 \
+              --description "Issue relevance to this repository has been verified" \
+              2>/dev/null || true
+
+            gh issue edit ${{ inputs.issue_number }} \
+              --repo ${{ inputs.repository }} \
+              --add-label relevance-confirmed
+
+            echo "skip_triage=false" >> $GITHUB_OUTPUT
+
+          elif [ "$RELEVANT" = "false" ] && [ "$CONFIDENCE" != "LOW" ]; then
+            echo "❌ Wrong repository detected with $CONFIDENCE confidence"
+            echo "  - Reason: $REASON"
+
+            # Create and add wrong-repo label
+            gh label create wrong-repo \
+              --repo ${{ inputs.repository }} \
+              --color d73a4a \
+              --description "Issue belongs in a different repository" \
+              2>/dev/null || true
+
+            gh issue edit ${{ inputs.issue_number }} \
+              --repo ${{ inputs.repository }} \
+              --add-label wrong-repo
+
+            echo "skip_triage=true" >> $GITHUB_OUTPUT
+            exit 0
+
+          else
+            echo "⚠️ Uncertain relevance assessment, proceeding with triage"
+            echo "skip_triage=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ==================================================
+      # MAIN TRIAGE ANALYSIS
+      # ==================================================
+
+      - name: Supersede Previous Triage Comments
+        id: supersede-comments
+        if: steps.parse-relevance.outputs.skip_triage != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "🔍 Checking for previous triage comments on issue #${{ inputs.issue_number }}"
+
+          # Get all comments on the issue
+          gh api repos/${{ inputs.repository }}/issues/${{ inputs.issue_number }}/comments --paginate > /tmp/all_comments.json
+
+          # Find unsuperseded triage comments from github-actions[bot]
+          cat /tmp/all_comments.json | jq -r '.[] |
+            select(.user.login == "github-actions[bot]") |
+            select(.body | contains("## Triage Analysis")) |
+            select(.body | contains("<!-- TRIAGE_SUPERSEDED -->") | not) |
+            .id' > /tmp/triage_comment_ids.txt
+
+          COUNT=$(wc -l < /tmp/triage_comment_ids.txt | tr -d ' ')
+          echo "Found $COUNT unsuperseded triage comment(s)"
+
+          if [ "$COUNT" -gt 0 ]; then
+            echo "📝 Superseding previous triage comments..."
+
+            while IFS= read -r COMMENT_ID; do
+              echo "Processing comment ID: $COMMENT_ID"
+
+              # Get the existing comment body
+              EXISTING_BODY=$(gh api repos/${{ inputs.repository }}/issues/comments/$COMMENT_ID --jq '.body')
+
+              # Wrap in collapsible section with superseded marker
+              NEW_BODY="<!-- TRIAGE_SUPERSEDED -->
+          <details>
+          <summary>⚠️ <b>Superseded Triage Analysis</b> - Click to view previous analysis</summary>
+
+          $EXISTING_BODY
+
+          </details>
+
+          ---
+          *This triage analysis has been superseded by a newer analysis. See the latest comment below for current information.*"
+
+              # Update the comment
+              gh api -X PATCH repos/${{ inputs.repository }}/issues/comments/$COMMENT_ID \
+                --field body="$NEW_BODY" || echo "Warning: Failed to update comment $COMMENT_ID"
+
+              echo "✅ Successfully superseded comment $COMMENT_ID"
+            done < /tmp/triage_comment_ids.txt
+          fi
+
+      # ============================================================================
+      # TRIAGE ANALYSIS - Inline Claude CLI execution
+      # ============================================================================
+      - name: Write Triage System Prompt
+        if: steps.parse-relevance.outputs.skip_triage != 'true'
+        run: |
+          cat > ${{ runner.temp }}/triage-system-prompt.txt << 'EOF'
+          You are an issue triage assistant performing READ-ONLY analysis.
+          You MUST post your analysis as a comment using mcp__github__add_issue_comment.
+          Include the hidden metadata format at the end of your comment.
+          Do NOT attempt to modify code or create branches.
+
+          CRITICAL: You have access to Glob and Grep tools for searching the codebase.
+          - Use Glob to find files by pattern (e.g., "**/*.php", "database/**/*.sql")
+          - Use Grep to search for code patterns, class names, function names, table names
+          - Always search the codebase BEFORE writing your triage comment
+          - Link to specific files and line numbers in the Related Source Code section
+
+          IMPORTANT: A complete issue manifest with all comments and attachments is available at:
+          ${{ runner.temp }}/issue-data/manifest.md
+
+          Use the Read tool to access this manifest for comprehensive issue analysis.
+          The manifest includes:
+          - Complete issue body and metadata
+          - All comments with timestamps and authors
+          - Downloaded attachments with file paths for analysis
+          - Attachment metadata (file types, sizes, dimensions)
+
+          Read the manifest first to get complete context before performing triage analysis.
+          EOF
+
+      - name: Perform Triage Analysis
+        id: triage-analysis
+        if: steps.parse-relevance.outputs.skip_triage != 'true'
+        timeout-minutes: 30
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+          ISSUE_MANIFEST_PATH: ${{ steps.fetch-complete.outputs.manifest_path }}
+        run: |
+          set +e
+          export PATH="$HOME/.claude/local/bin:$PATH"
+
+          claude -p "$(cat ${{ runner.temp }}/claude-prompts/triage-analysis.txt)" \
+            --mcp-config "${{ runner.temp }}/mcp-config/github.json" \
+            --allowedTools "Read,WebFetch,Glob,Grep,mcp__github__add_issue_comment,mcp__github__get_issue,mcp__github__list_issue_comments,mcp__github__create_issue,mcp__github__search_issues" \
+            --disallowedTools "Edit,Write,MultiEdit,NotebookEdit,Bash,Task,LS" \
+            --system-prompt "$(cat ${{ runner.temp }}/triage-system-prompt.txt)" \
+            --output-format stream-json \
+            --verbose 2>&1 | tee /tmp/triage-output.json
+
+          exit_code=${PIPESTATUS[0]}
+
+          # Capture output for downstream steps
+          if [[ -f /tmp/triage-output.json ]]; then
+            echo "output<<OUTPUT_EOF" >> $GITHUB_OUTPUT
+            cat /tmp/triage-output.json >> $GITHUB_OUTPUT
+            echo "OUTPUT_EOF" >> $GITHUB_OUTPUT
+          fi
+
+          exit $exit_code
+
+      # ==================================================
+      # LABEL APPLICATION
+      # ==================================================
+
+      - name: Apply Labels and Set Issue Type
+        if: steps.parse-relevance.outputs.skip_triage != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Get issue number
+            const issue_number = ${{ inputs.issue_number }};
+            if (!issue_number) {
+              console.log('No issue number found');
+              return;
+            }
+
+            // Wait for Claude's comment to be posted
+            await new Promise(resolve => setTimeout(resolve, 20000));
+
+            // Get the latest comment
+            const comments = await github.rest.issues.listComments({
+              owner: '${{ inputs.repository_owner }}',
+              repo: ('${{ inputs.repository_name }}' || '${{ inputs.repository }}'.split('/')[1]),
+              issue_number: issue_number
+            });
+
+            if (comments.data.length === 0) {
+              console.log('No comments found');
+              return;
+            }
+
+            const latestComment = comments.data[comments.data.length - 1];
+            const commentBody = latestComment.body;
+
+            // Extract metadata
+            const metadataMatch = commentBody.match(/==METADATA==(.*?)==METADATA==/);
+            if (!metadataMatch) {
+              console.log('No metadata found in comment');
+              return;
+            }
+
+            let metadata;
+            try {
+              metadata = JSON.parse(metadataMatch[1]);
+              console.log('Parsed metadata:', metadata);
+            } catch (error) {
+              console.error('Failed to parse metadata:', error);
+              return;
+            }
+
+            // Build labels array
+            const labels = [];
+
+            if (metadata.priority) {
+              labels.push(`priority: ${metadata.priority}`);
+            }
+
+            if (metadata.complexity) {
+              labels.push(`complexity: ${metadata.complexity}`);
+            }
+
+            if (metadata.areas && Array.isArray(metadata.areas)) {
+              metadata.areas.forEach(area => {
+                labels.push(`area: ${area}`);
+              });
+            }
+
+            if (metadata.specialFlags && Array.isArray(metadata.specialFlags)) {
+              metadata.specialFlags.forEach(flag => {
+                labels.push(flag);
+              });
+            }
+
+            // Handle duplicates
+            if (metadata.duplicates && Array.isArray(metadata.duplicates) && metadata.duplicates.length > 0) {
+              const highConfidenceDuplicates = metadata.duplicates.filter(d => d.confidence === 'HIGH');
+              if (highConfidenceDuplicates.length > 0) {
+                labels.push('duplicate');
+                console.log(`Found ${highConfidenceDuplicates.length} high-confidence duplicate(s)`);
+              }
+            }
+
+            // Apply labels
+            if (labels.length > 0) {
+              try {
+                await github.rest.issues.addLabels({
+                  owner: '${{ inputs.repository_owner }}',
+                  repo: ('${{ inputs.repository_name }}' || '${{ inputs.repository }}'.split('/')[1]),
+                  issue_number: issue_number,
+                  labels: labels
+                });
+                console.log(`Applied labels: ${labels.join(', ')}`);
+              } catch (error) {
+                console.error('Failed to apply labels:', error.message);
+              }
+            }
+
+            // Add triaged label to indicate successful completion
+            try {
+              // Create label if it doesn't exist
+              try {
+                await github.rest.issues.createLabel({
+                  owner: '${{ inputs.repository_owner }}',
+                  repo: ('${{ inputs.repository_name }}' || '${{ inputs.repository }}'.split('/')[1]),
+                  name: 'triaged',
+                  color: '28a745',
+                  description: 'Issue has been successfully triaged by Claude'
+                });
+              } catch (e) {
+                // Label probably exists
+              }
+
+              await github.rest.issues.addLabels({
+                owner: '${{ inputs.repository_owner }}',
+                repo: ('${{ inputs.repository_name }}' || '${{ inputs.repository }}'.split('/')[1]),
+                issue_number: issue_number,
+                labels: ['triaged']
+              });
+              console.log('✅ Added triaged label - triage complete!');
+            } catch (error) {
+              console.error('Failed to add triaged label:', error.message);
+            }
+
+      # ==================================================
+      # BUG REPRODUCER TRIGGER
+      # ==================================================
+
+      - name: Trigger Bug Reproducer for Bug Issues
+        if: steps.parse-relevance.outputs.skip_triage != 'true' && inputs.issue_number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          REPOSITORY: ${{ inputs.repository }}
+        run: bash .ai-tools-resources/scripts/workflow-resources/triage-reusable/trigger-bug-reproducer.sh
+
+      # ==================================================
+      # ERROR HANDLING
+      # ==================================================
+
+      - name: Handle Errors
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue_number = ${{ inputs.issue_number }};
+            if (issue_number) {
+              await github.rest.issues.createComment({
+                owner: '${{ inputs.repository_owner }}',
+                repo: ('${{ inputs.repository_name }}' || '${{ inputs.repository }}'.split('/')[1]),
+                issue_number: issue_number,
+                body: '⚠️ Claude analysis encountered an issue. [View logs](${{ github.server_url }}/${{ inputs.repository }}/actions/runs/${{ github.run_id }})'
+              });
+            }
+
+      # ==================================================
+      # CLEANUP
+      # ==================================================
+
+      - name: Remove Workflow Coordination Labels
+        if: always() && inputs.issue_number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ inputs.repository }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: bash .ai-tools-resources/scripts/workflow-resources/triage-reusable/remove-coordination-labels.sh

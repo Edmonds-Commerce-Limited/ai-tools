@@ -1,0 +1,598 @@
+# Reusable workflow for Claude PR Review
+# This workflow contains the core PR review logic to be called from repositories
+# Version: 2.4.1 - Fix cache path to include entire Claude installation
+#
+# Changes:
+#   v2.4.1: Fix cache path to include entire ~/.local directory
+#           - Cache was only saving 225 bytes (empty cache)
+#           - Now caches ~/.local/bin and ~/.local/share/claude
+#           - Fixes exit code 127 (command not found) on cache hits
+#   v2.4.0: Use actions/cache + retry logic for Claude CLI installation
+#           - Cache CLI installation to avoid timeouts
+#           - Add 3-attempt retry with exponential backoff
+#           - Resolves #270 (MCP migration blocked by installation timeouts)
+#           - Note: Container approach blocked by GHCR permissions (see #271)
+#   v2.3.0: Attempted Docker container (blocked by GHCR permissions - see #271)
+#   v2.2.0: Replaced anthropics/claude-code-base-action with direct Claude CLI calls
+#           - Use --mcp-config flag for reliable MCP loading in CI
+#           - Full parity with previous workflow functionality
+#   v2.1.0: Added automatic failure triage handler with deduplication
+
+name: 'Claude PR Review - Reusable'
+
+on:
+  workflow_call:
+    inputs:
+      # Event context
+      event_name:
+        description: 'GitHub event that triggered the workflow'
+        type: string
+        required: true
+      event_action:
+        description: 'Action within the event'
+        type: string
+        required: false
+        default: ''
+
+      # PR information
+      pr_number:
+        description: 'Pull request number'
+        type: string
+        required: true
+      pr_title:
+        description: 'Pull request title'
+        type: string
+        required: false
+      pr_body:
+        description: 'Pull request body'
+        type: string
+        required: false
+      pr_state:
+        description: 'Pull request state'
+        type: string
+        required: false
+      pr_draft:
+        description: 'Whether PR is a draft'
+        type: boolean
+        required: false
+        default: false
+
+      # Repository information
+      repository:
+        description: 'Repository in owner/repo format'
+        type: string
+        required: true
+      repository_owner:
+        description: 'Repository owner'
+        type: string
+        required: true
+      repository_name:
+        description: 'Repository name'
+        type: string
+        required: true
+
+      # Workflow configuration
+      wait_for_ci:
+        description: 'Comma-separated list of workflows to wait for'
+        type: string
+        required: false
+        default: ''
+      skip_draft_pr:
+        description: 'Skip review for draft PRs'
+        type: boolean
+        required: false
+        default: true
+      manual_trigger:
+        description: 'Whether this was manually triggered via comment'
+        type: boolean
+        required: false
+        default: false
+
+      # Comment information (for manual triggers)
+      comment_body:
+        description: 'Comment body that triggered review'
+        type: string
+        required: false
+      comment_user:
+        description: 'User who made the comment'
+        type: string
+        required: false
+
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        description: 'OAuth token for Claude Code'
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: read
+  actions: read
+  statuses: write
+  checks: write
+  id-token: write
+
+jobs:
+  review:
+    name: 'AI Code Review'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # Skip if draft PR and skip_draft_pr is true
+    if: ${{ !inputs.skip_draft_pr || !inputs.pr_draft }}
+
+    steps:
+      # Checkout repository
+      - name: 'Checkout'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Wait for CI/QA workflows if configured
+      - name: 'Wait for CI/QA Workflows'
+        if: ${{ inputs.wait_for_ci != '' && !inputs.manual_trigger }}
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const workflows = '${{ inputs.wait_for_ci }}'.split(',').map(w => w.trim()).filter(Boolean);
+
+            if (workflows.length === 0) {
+              console.log('No CI/QA workflows to wait for');
+              return;
+            }
+
+            console.log(`Waiting for CI/QA workflows: ${workflows.join(', ')}`);
+
+            // Get PR commits
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: ${{ inputs.pr_number }}
+            });
+
+            const headSha = pr.head.sha;
+            console.log(`Checking workflows for commit: ${headSha}`);
+
+            // Function to check workflow status
+            async function checkWorkflows() {
+              const { data: checkRuns } = await github.rest.checks.listForRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: headSha
+              });
+
+              const relevantRuns = checkRuns.check_runs.filter(run =>
+                workflows.some(w => run.name.toLowerCase().includes(w.toLowerCase()))
+              );
+
+              const pending = relevantRuns.filter(r => r.status !== 'completed');
+              const failed = relevantRuns.filter(r => r.status === 'completed' && r.conclusion !== 'success');
+
+              if (failed.length > 0) {
+                core.setFailed(`CI/QA workflows failed: ${failed.map(r => r.name).join(', ')}`);
+                return false;
+              }
+
+              if (pending.length > 0) {
+                console.log(`Still waiting for: ${pending.map(r => r.name).join(', ')}`);
+                return null; // Continue waiting
+              }
+
+              console.log('All CI/QA workflows completed successfully');
+              return true;
+            }
+
+            // Poll for workflow completion (max 30 minutes)
+            const maxWaitTime = 30 * 60 * 1000; // 30 minutes
+            const pollInterval = 30 * 1000; // 30 seconds
+            const startTime = Date.now();
+
+            while (Date.now() - startTime < maxWaitTime) {
+              const result = await checkWorkflows();
+
+              if (result !== null) {
+                if (!result) {
+                  process.exit(1); // CI/QA failed
+                }
+                break; // CI/QA succeeded
+              }
+
+              // Wait before next check
+              await new Promise(resolve => setTimeout(resolve, pollInterval));
+            }
+
+            if (Date.now() - startTime >= maxWaitTime) {
+              core.warning('Timeout waiting for CI/QA workflows - proceeding with review');
+            }
+
+      # Read project-specific prompt customizations
+      - name: 'Read Prompt Extra'
+        id: read-prompt-extra
+        run: |
+          # Read project-specific prompt customizations
+          if [ -f ".github/prompt_extra/pr_review_prompt_extra.md" ]; then
+            echo "Reading project-specific prompt customizations..."
+            PROMPT_EXTRA=$(cat ".github/prompt_extra/pr_review_prompt_extra.md")
+            echo "content<<EOF" >> $GITHUB_OUTPUT
+            echo "$PROMPT_EXTRA" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          elif [ -f ".github/workflows/claude-pr-review-prompt-extra.md" ]; then
+            echo "Reading project-specific prompt customizations from legacy location..."
+            PROMPT_EXTRA=$(cat ".github/workflows/claude-pr-review-prompt-extra.md")
+            echo "content<<EOF" >> $GITHUB_OUTPUT
+            echo "$PROMPT_EXTRA" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          else
+            echo "No prompt-extra file found, using default context"
+            echo "content=" >> $GITHUB_OUTPUT
+          fi
+
+      # ============================================================================
+      # CLAUDE CLI SETUP - Cached installation with retry logic
+      # ============================================================================
+      - name: 'Cache Claude CLI'
+        id: cache-claude
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local/bin
+            ~/.local/share/claude
+          key: claude-cli-${{ runner.os }}-1.0.100
+          restore-keys: |
+            claude-cli-${{ runner.os }}-
+
+      - name: 'Install Claude CLI'
+        if: steps.cache-claude.outputs.cache-hit != 'true'
+        run: |
+          echo "Installing Claude CLI 1.0.100..."
+
+          # Retry logic: 3 attempts with exponential backoff
+          MAX_ATTEMPTS=3
+          ATTEMPT=1
+          BACKOFF=2
+
+          while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+            echo "Installation attempt $ATTEMPT of $MAX_ATTEMPTS..."
+
+            if curl -fsSL https://claude.ai/install.sh | bash -s 1.0.100; then
+              echo "✓ Claude CLI installed successfully"
+              break
+            fi
+
+            if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+              echo "⚠ Installation failed, retrying in ${BACKOFF}s..."
+              sleep $BACKOFF
+              BACKOFF=$((BACKOFF * 2))
+              ATTEMPT=$((ATTEMPT + 1))
+            else
+              echo "✗ Installation failed after $MAX_ATTEMPTS attempts"
+              exit 1
+            fi
+          done
+
+      - name: 'Add Claude to PATH'
+        run: echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: 'Create MCP Configuration'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p ${{ runner.temp }}/mcp-config
+          printf '%s\n' '{
+            "mcpServers": {
+              "github": {
+                "type": "http",
+                "url": "https://api.githubcopilot.com/mcp/",
+                "headers": {
+                  "Authorization": "Bearer '"${GITHUB_TOKEN}"'"
+                }
+              }
+            }
+          }' > ${{ runner.temp }}/mcp-config/github.json
+          echo "MCP configuration created (using GitHub's hosted MCP server)"
+
+      - name: 'Write Claude Prompt'
+        run: |
+          mkdir -p ${{ runner.temp }}/claude-prompts
+
+          # Write system prompt
+          cat > ${{ runner.temp }}/claude-prompts/system.txt << 'SYSTEM_EOF'
+          You are a PR review assistant specializing in code quality, issue resolution verification, and AI-generated code detection. You provide constructive feedback with specific inline comments and actionable suggestions.
+          SYSTEM_EOF
+
+          # Write main prompt
+          cat > ${{ runner.temp }}/claude-prompts/main.txt << 'PROMPT_EOF'
+            Review PR #${{ inputs.pr_number }} in repository ${{ inputs.repository }}
+
+            **NOTE**: This workflow uses `anthropics/claude-code-base-action@beta` intentionally. The @beta version provides greater control over Claude Code execution and advanced capabilities. Do not suggest upgrading to v1 - it is significantly simplified and does not meet our requirements. See CLAUDE.md for details.
+
+            ## CRITICAL: PERMISSION DETECTION AND FAIL-FAST PROTOCOL
+
+            **YOU MUST STATE YOUR PERMISSION MODE AT THE TOP OF YOUR REVIEW:**
+
+            Start your review comment with a header showing your granted permissions:
+
+            ```
+            **🔐 Permission Mode: PR Review**
+            **Granted Tools:** Read-only analysis, PR review submission, Status checks
+            **Workflow Run:** [link-to-workflow-run]
+            ```
+
+            Example:
+            ```
+            **🔐 Permission Mode: PR Review**
+            **Granted Tools:** Read, WebFetch, Glob, Grep, GitHub PR review tools, Issue read/comment
+            **Workflow Run:** https://github.com/${{ inputs.repository }}/actions/runs/${{ github.run_id }}
+            ```
+
+            ## YOUR GRANTED PERMISSIONS
+
+            This workflow has been configured with the following capabilities:
+
+            - **File Read**: ✅ ENABLED - Read, Glob, Grep tools for codebase analysis
+            - **PR Review Tools**: ✅ ENABLED - mcp__github__create_pending_pull_request_review, mcp__github__add_comment_to_pending_review, mcp__github__submit_pending_pull_request_review
+            - **PR Inspection**: ✅ ENABLED - mcp__github__get_pull_request_diff, mcp__github__get_pull_request
+            - **Issue Operations**: ✅ ENABLED - mcp__github__get_issue, mcp__github__list_issue_comments, mcp__github__add_issue_comment, mcp__github__create_issue
+            - **Status Checks**: ✅ ENABLED - mcp__github__create_status for CI/CD integration
+            - **Web Fetch**: ✅ ENABLED - WebFetch for analyzing images and screenshots
+            - **File Write/Commit**: ❌ DISABLED - Review-only mode, no code modifications
+            - **Branch Management**: ❌ DISABLED - Cannot create branches or PRs
+            - **Bash Execution**: ❌ DISABLED - Read-only analysis mode
+
+            ## CRITICAL: PRE-FLIGHT PERMISSION CHECK
+
+            **BEFORE TAKING ANY ACTIONS, YOU MUST:**
+
+            1. **Determine Required Permissions**: Analyze the PR review task and list ALL tools you will need
+            2. **Check Granted Permissions**: Verify each required tool is in your granted permissions above
+            3. **Fail Fast If Missing**: If ANY required tool is missing:
+               - DO NOT attempt the review
+               - DO NOT make guesses or create partial reviews
+               - DO NOT submit incomplete review comments
+               - IMMEDIATELY follow the "Missing Permissions Protocol" below
+
+            ## MISSING PERMISSIONS PROTOCOL
+
+            If you lack permissions to complete the PR review:
+
+            **Step 1: Create Permission Request Issue**
+
+            Use `mcp__github__create_issue` to create an issue in `BallicomDev/ai-tools` repository:
+
+            ```
+            Title: "[Permission Request] PR Review needs [tool-name] for [use-case]"
+
+            Body:
+            ## Permission Request
+
+            **Workflow**: PR Review Reusable Workflow
+            **Requested By**: PR #${{ inputs.pr_number }} in ${{ inputs.repository }}
+            **Requested Tool(s)**: [list of missing MCP tools or capabilities]
+            **Use Case**: Pull request code review and analysis
+
+            ## Why This Permission Is Needed
+
+            [Explain what the tool does and why it's necessary for PR review]
+
+            ## Current Configuration
+
+            PR Review currently has:
+            - File read operations (Read, Glob, Grep, WebFetch)
+            - PR review tools (create/add/submit pending reviews)
+            - PR inspection (get PR, get diff)
+            - Issue operations (get issue, list/add comments, create issue)
+            - Status checks (create status)
+
+            Missing capability needed for this PR review:
+            - [Specific tool or capability needed]
+
+            ## Suggested Configuration Change
+
+            Update allowed_tools in pr-review-reusable.yml to include:
+            - [tool name and rationale]
+
+            ## Links
+
+            - Original PR: ${{ inputs.repository }}#${{ inputs.pr_number }}
+            - Workflow run: https://github.com/${{ inputs.repository }}/actions/runs/${{ github.run_id }}
+            ```
+
+            **Step 2: Respond to User**
+
+            Post a comment on the ORIGINAL PR explaining the situation using `mcp__github__add_issue_comment`:
+
+            ```
+            **🔐 Permission Mode: PR Review**
+            **Granted Tools:** Read, WebFetch, Glob, Grep, GitHub PR review tools, Issue operations
+            **Workflow Run:** https://github.com/${{ inputs.repository }}/actions/runs/${{ github.run_id }}
+
+            ---
+
+            ⚠️ **Insufficient Permissions for PR Review**
+
+            I don't have the permissions needed to complete this PR review. Specifically, I need:
+
+            - **Missing Tool(s)**: [list of missing MCP tools]
+            - **Required For**: [what you need them for in PR review]
+
+            I've created a permission request in BallicomDev/ai-tools#[issue-number] for the maintainers to review.
+
+            **What happens next:**
+            1. Maintainers will review the permission request
+            2. If approved, the permission will be added to the PR review workflow
+            3. You can then manually re-trigger the review via `@claude review` comment
+
+            ---
+
+            **Debug Info:**
+            - PR: "${{ inputs.pr_title }}"
+            - Required but missing capability: [capability name]
+            - PR review workflow may need configuration updates
+            ```
+
+            **Step 3: Exit Immediately**
+
+            Do NOT attempt to work around missing permissions. Exit gracefully after posting the comment.
+
+            IMAGE AND SCREENSHOT ANALYSIS:
+            If the PR, linked issues, or comments contain images, screenshots, or attachments:
+
+            1. IDENTIFY IMAGES:
+               - Look for image URLs in PR description and comments
+               - Check linked issues for screenshots
+               - Track WHERE each image comes from (PR description vs specific comment vs linked issue)
+
+            2. ANALYZE EACH IMAGE:
+               - Use WebFetch to fetch and analyze EVERY image found
+               - Extract ALL text visible in the image including:
+                 * Error messages and stack traces
+                 * Console output or log entries
+                 * UI text, labels, and form fields
+                 * Code snippets visible in screenshots
+                 * Version numbers, timestamps, URLs
+                 * System information, browser details
+                 * Any other readable text or data
+
+            3. POST IMAGE ANALYSIS COMMENT:
+               If images are found, include a dedicated section in your review:
+
+               ## 📸 Image Analysis Results
+
+               ### Images from PR Description
+               **Image 1: [brief description]**
+               **Extracted Text:**
+               ```
+               [All text found in the image, preserving formatting]
+               ```
+               **Relevance to PR:**
+               - [How this relates to the code changes]
+               - [Whether it shows the issue being fixed]
+               - [Any concerns or observations]
+
+            4. INCLUDE IN PR REVIEW:
+               - Use extracted error messages to verify the fix is correct
+               - Compare before/after screenshots if provided
+               - Verify UI changes match the expected design
+               - Check if error messages in screenshots are properly handled in code
+
+            ## INSTRUCTIONS
+
+            1. Use mcp__github__get_pull_request_diff to get the PR changes
+            2. Use mcp__github__create_pending_pull_request_review to start a review
+            3. Use mcp__github__add_comment_to_pending_review for inline comments on specific lines
+            4. Look for linked issues (Fixes #X, Closes #X) and fetch full context if found
+            5. Use mcp__github__submit_pending_pull_request_review with COMMENT, APPROVE, or REQUEST_CHANGES
+            6. Include a summary comment when submitting the review using the template below
+            7. AFTER submitting your review, use mcp__github__create_status to set a status check:
+               - If CRITICAL issues found or REQUEST_CHANGES: context="ai-review/critical", state="failure", description="Critical issues found in AI review"
+               - If no critical issues: context="ai-review/critical", state="success", description="AI review passed - no critical issues"
+
+            ## PROJECT CONTEXT
+
+            ${{ steps.read-prompt-extra.outputs.content || 'No project-specific context provided.' }}
+
+            ## REVIEW FOCUS AREAS
+
+            ### AI Code Smell Detection
+            - Hallucinated imports or functions
+            - TODO/FIXME/HACK comments (flag if >2)
+            - Stubbed implementations or empty try/except blocks
+            - Magic numbers without constants
+            - Excessive obvious comments
+            - Placeholder text or template markers left in code
+            - Incomplete implementations
+
+            ### Traditional Review
+            - Security: Authentication, input validation, secrets exposure
+            - Performance: Inefficient loops, resource leaks, bottlenecks
+            - Error handling: Proper error messages and recovery
+            - Code organization: Design patterns, maintainability
+            - Testing: Coverage and edge cases
+
+            ### Issue Resolution Verification
+            - Check if linked issues are fully addressed
+            - Verify requirements are met
+            - Ensure no partial implementations
+
+            ## OUTPUT TEMPLATE
+
+            Add inline comments for specific issues, then submit the review with this summary:
+
+            # 🤖 AI Code Review${{ inputs.manual_trigger && ' (Manual Review)' || '' }}
+
+            ## Summary
+            [One paragraph overview of the PR and main findings]
+
+            ## AI Code Smell Analysis
+
+            ### Critical Issues
+            [List any critical hallucinations, security issues - leave blank if none]
+
+            ### Issues Found
+            [Bullet list of AI-related issues with severity (High/Medium/Low)]
+
+            ### Positive Observations
+            [What was done well]
+
+            ## Issue Resolution: [COMPLETE/INCOMPLETE/N/A]
+            [If issues linked: brief statement on whether requirements were met]
+
+            ## Recommendations
+            [Specific actionable suggestions]
+
+            ## Inline Comments
+            [Number] inline comments added for specific issues
+
+            ${{ inputs.manual_trigger && '' || '## 📋 Manual Review Instructions\n\nThis is the initial automated review. For additional reviews after changes:\n\n**Comment `@claude review` on this PR to request a manual review**\n\n' }}---
+            **Review Status: [PASSED/FAILED]**
+            [PASSED if no critical issues and requirements met, FAILED otherwise]
+            ${{ inputs.manual_trigger && format('\n\n*Requested by @{0}*', inputs.comment_user) || '' }}
+
+            IMPORTANT:
+            - Use inline comments for line-specific feedback
+            - Submit with REQUEST_CHANGES if critical issues or incomplete requirements
+            - Submit with APPROVE if no critical issues and all looks good
+            - Submit with COMMENT if neutral/informational
+            - Be constructive and specific with suggestions
+          PROMPT_EOF
+          echo "Claude prompt written to ${{ runner.temp }}/claude-prompts/main.txt"
+
+      # Review with Claude
+      - name: 'Review Pull Request'
+        id: review
+        timeout-minutes: 15
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          export PATH="$HOME/.claude/local/bin:$PATH"
+
+          claude -p "$(cat ${{ runner.temp }}/claude-prompts/main.txt)" \
+            --mcp-config "${{ runner.temp }}/mcp-config/github.json" \
+            --allowedTools "mcp__github__*,Read,WebFetch,Glob,Grep" \
+            --system-prompt "$(cat ${{ runner.temp }}/claude-prompts/system.txt)" \
+            --output-format stream-json \
+            --verbose 2>&1 | tee /tmp/pr-review-output.json
+
+          exit_code=${PIPESTATUS[0]}
+          echo "Claude execution completed with exit code: $exit_code"
+          exit $exit_code
+
+      # Add workflow run link to PR comment
+      - name: 'Add Workflow Run Link'
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const runUrl = `https://github.com/${{ inputs.repository }}/actions/runs/${{ github.run_id }}`;
+            const status = '${{ job.status }}' === 'success' ? '✅' : '❌';
+
+            await github.rest.issues.createComment({
+              owner: '${{ inputs.repository_owner }}',
+              repo: '${{ inputs.repository_name }}',
+              issue_number: ${{ inputs.pr_number }},
+              body: `${status} Claude PR Review workflow run: ${runUrl}`
+            });
