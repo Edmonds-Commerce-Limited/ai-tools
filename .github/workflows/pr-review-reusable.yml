@@ -96,6 +96,11 @@ on:
         type: boolean
         required: false
         default: false
+      claude_model:
+        description: 'Claude model ID passed to the CLI (the CLI default is a retired model)'
+        type: string
+        required: false
+        default: 'claude-opus-5-5'
 
       # Comment information (for manual triggers)
       comment_body:
@@ -579,6 +584,7 @@ jobs:
           export PATH="$HOME/.claude/local/bin:$PATH"
 
           claude -p "$(cat ${{ runner.temp }}/claude-prompts/main.txt)" \
+            --model "${{ inputs.claude_model }}" \
             --mcp-config "${{ runner.temp }}/mcp-config/github.json" \
             --allowedTools "Read,WebFetch,Glob,Grep,mcp__github__get_pull_request,mcp__github__get_file_contents,mcp__github__list_commits,mcp__github__create_issue_comment,mcp__github__get_issue,mcp__github__search_code,mcp__github__create_or_update_file,mcp__github__push_files,mcp__github__create_pull_request_review" \
             --system-prompt "$(cat ${{ runner.temp }}/claude-prompts/system.txt)" \

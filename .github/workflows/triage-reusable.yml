@@ -81,6 +81,11 @@ on:
         type: boolean
         required: false
         default: false
+      claude_model:
+        description: 'Claude model ID passed to the CLI (the CLI default is a retired model)'
+        type: string
+        required: false
+        default: 'claude-opus-5-5'
 
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN:
@@ -334,6 +339,7 @@ jobs:
           export PATH="$HOME/.claude/local/bin:$PATH"
 
           claude -p "$(cat ${{ runner.temp }}/claude-prompts/relevance-check.txt)" \
+            --model "${{ inputs.claude_model }}" \
             --mcp-config "${{ runner.temp }}/mcp-config/github.json" \
             --allowedTools "Read,WebFetch,Glob,Grep,mcp__github__add_issue_comment,mcp__github__get_issue,mcp__github__list_issue_comments,mcp__github__create_issue" \
             --disallowedTools "Edit,Write,MultiEdit,NotebookEdit,Bash,Task,LS" \
@@ -569,6 +575,7 @@ jobs:
           export PATH="$HOME/.claude/local/bin:$PATH"
 
           claude -p "$(cat ${{ runner.temp }}/claude-prompts/triage-analysis.txt)" \
+            --model "${{ inputs.claude_model }}" \
             --mcp-config "${{ runner.temp }}/mcp-config/github.json" \
             --allowedTools "Read,WebFetch,Glob,Grep,mcp__github__add_issue_comment,mcp__github__get_issue,mcp__github__list_issue_comments,mcp__github__create_issue,mcp__github__search_issues" \
             --disallowedTools "Edit,Write,MultiEdit,NotebookEdit,Bash,Task,LS" \
