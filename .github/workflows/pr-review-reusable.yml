@@ -97,10 +97,10 @@ on:
         required: false
         default: false
       claude_model:
-        description: 'Claude model ID passed to the CLI (the CLI default is a retired model)'
+        description: 'Claude model alias or ID passed to the CLI; the alias opus means the latest Opus'
         type: string
         required: false
-        default: 'claude-opus-5-5'
+        default: 'opus'
 
       # Comment information (for manual triggers)
       comment_body:
@@ -245,21 +245,12 @@ jobs:
       # ============================================================================
       # CLAUDE CLI SETUP - Cached installation with retry logic
       # ============================================================================
-      - name: 'Cache Claude CLI'
-        id: cache-claude
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.local/bin
-            ~/.local/share/claude
-          key: claude-cli-${{ runner.os }}-1.0.100
-          restore-keys: |
-            claude-cli-${{ runner.os }}-
-
+      # Always install the latest CLI: model aliases such as `opus` resolve inside
+      # the CLI, so a pinned old CLI resolves them to retired models. No cache,
+      # because a cache keyed on "latest" would never update.
       - name: 'Install Claude CLI'
-        if: steps.cache-claude.outputs.cache-hit != 'true'
         run: |
-          echo "Installing Claude CLI 1.0.100..."
+          echo "Installing Claude CLI latest..."
 
           # Retry logic: 3 attempts with exponential backoff
           MAX_ATTEMPTS=3
@@ -269,7 +260,7 @@ jobs:
           while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
             echo "Installation attempt $ATTEMPT of $MAX_ATTEMPTS..."
 
-            if curl -fsSL https://claude.ai/install.sh | bash -s 1.0.100; then
+            if curl -fsSL https://claude.ai/install.sh | bash -s latest; then
               echo "✓ Claude CLI installed successfully"
               break
             fi
